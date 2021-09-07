@@ -23,6 +23,7 @@
 #include <brpc/controller.h>
 #include <brpc/channel.h>
 #include "braft/cli.pb.h"
+#include "bthread/bthread.h"
 
 namespace braft {
 namespace rtb {
@@ -163,6 +164,58 @@ int update_leader(const GroupId& group, const std::string& leader_str) {
     return update_leader(group, leader_id);
 }
 
+struct get_leader_args {
+    bthread_mutex_t mutex;
+    bool success;
+    int count;
+    bthread_cond_t cond;
+    std::string leader;
+    bool consumed;
+    butil::Status* result;
+};
+
+static void _on_get_leader_returned(brpc::Controller* cntl, get_leader_args* args,
+    GetLeaderResponse* response, std::string peer)
+{
+    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+    std::unique_ptr<GetLeaderResponse> res_guard(response);
+    bthread_mutex_lock(&args->mutex);
+    args->count--;
+    if (!cntl->Failed()) {
+        if (!args->success) {
+            args->success = true;
+            args->leader = response->leader_id();
+            bthread_cond_signal(&args->cond);
+            if (args->count) {
+                bthread_mutex_unlock(&args->mutex);
+                return;
+            }
+        }
+    } else {
+        std::string str = args->result->error_str();
+        args->result->set_error(cntl->ErrorCode(), "%s, [%s] %s",
+            str.c_str(),
+            peer.c_str(),
+            cntl->ErrorText().c_str());
+    }
+    if (!args->count) {
+        if (!args->success) {
+            bthread_cond_signal(&args->cond);
+        }
+        while (!args->consumed) {
+            bthread_mutex_unlock(&args->mutex);
+            bthread_usleep(1000L);
+            bthread_mutex_lock(&args->mutex);
+        }
+        bthread_mutex_unlock(&args->mutex);
+        bthread_cond_destroy(&args->cond);
+        bthread_mutex_destroy(&args->mutex);
+        delete args;
+        return;
+    }
+    bthread_mutex_unlock(&args->mutex);
+}
+
 butil::Status refresh_leader(const GroupId& group, int timeout_ms) {
     RouteTable* const rtb = RouteTable::GetInstance();
     Configuration conf;
@@ -171,6 +224,13 @@ butil::Status refresh_leader(const GroupId& group, int timeout_ms) {
                                     group.c_str());
     }
     butil::Status error;
+    struct get_leader_args* args = new get_leader_args;
+    bthread_mutex_init(&args->mutex, NULL);
+    args->success = false;
+    args->count = conf.size();
+    bthread_cond_init(&args->cond, NULL);
+    args->consumed = false;
+    args->result = &error;
     for (Configuration::const_iterator
             iter = conf.begin(); iter != conf.end(); ++iter) {
         brpc::Channel channel;
@@ -184,32 +244,37 @@ butil::Status refresh_leader(const GroupId& group, int timeout_ms) {
                                          saved_et.c_str(),
                                          iter->to_string().c_str());
             }
+            bthread_mutex_lock(&args->mutex);
+            args->count--;
+            bthread_mutex_unlock(&args->mutex);
             continue;
         }
-        brpc::Controller cntl;
-        cntl.set_timeout_ms(timeout_ms);
+        brpc::Controller* cntl = new brpc::Controller;
+        cntl->set_timeout_ms(timeout_ms);
         GetLeaderRequest request;
         request.set_group_id(group);
-        GetLeaderResponse respones;
+        GetLeaderResponse* responses = new GetLeaderResponse;
         CliService_Stub stub(&channel);
-        stub.get_leader(&cntl, &request, &respones, NULL);
-        if (!cntl.Failed()) {
-            update_leader(group, respones.leader_id());
-            return butil::Status::OK();
-        }
-        if (error.ok()) {
-            error.set_error(cntl.ErrorCode(), "[%s] %s",
-                                              iter->to_string().c_str(),
-                                              cntl.ErrorText().c_str());
-        } else {
-            std::string saved_et = error.error_str();
-            error.set_error(cntl.ErrorCode(), "%s, [%s] %s",
-                                              saved_et.c_str(),
-                                              iter->to_string().c_str(),
-                                              cntl.ErrorText().c_str());
-        }
+        google::protobuf::Closure* done = brpc::NewCallback(_on_get_leader_returned, cntl,
+            args, responses, iter->to_string());
+        stub.get_leader(cntl, &request, responses, done);
     }
-    return error;
+    bool success;
+    bthread_mutex_lock(&args->mutex);
+    if (!args->success && args->count) {
+        bthread_cond_wait(&args->cond, &args->mutex);
+    }
+    success = args->success;
+    if (args->success) {
+        update_leader(group, args->leader);
+    }
+    args->consumed = true;
+    bthread_mutex_unlock(&args->mutex);
+    if (success) {
+        return butil::Status::OK();
+    } else {
+        return error;
+    }
 }
 
 int select_leader(const GroupId& group, PeerId* leader) {
